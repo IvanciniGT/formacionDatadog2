@@ -36,7 +36,7 @@ Backend: https://datadog.ivanosuna.com/api
                                                             Si nuestra app lanza una query a BBDD, el trace_id se propaga a esa operación, permitiendo que la traza incluya también el tiempo y los detalles de la interacción con la base de datos.
                                                             En la BBDD llega como un comentario.
     ------------------------                     ---------------------------------------------------------------------
-          |                                                 |                                |
+          |                                                                                  |
           |                                       logs/métricas(nodo/contenedores)       Métricas / Eventos / Trazas propias de la App
     Habla directamente con los                              v                                v
     servidores de datadog                          Agente (se monta por nodo donde ejecutamos programas que queramos monitorizar)
