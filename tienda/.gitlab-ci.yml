@@ -1,0 +1,330 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# EL PIPELINE DEL ENTORNO DEL CURSO DE DATADOG. Lo monta cluster-51 sobre el
+# patrón de backend-examenes.
+#
+#     tag X.Y.Z SOBRE main  ->  en-main  ->  tests-api (JUnit, a Test Optimization)
+#         ->  imagen-api + imagen-web (Kaniko)
+#         ->  desplegar (lanza la plantilla de AWX y espera a que acabe)
+#         ->  evento-version (evento de cambio en Datadog: la barra vertical de las graficas)
+#         ->  marcar-shop-api -> marcar-shop-web (CD Visibility y DORA)
+#         ->  probar-synthetics (los robots de Datadog contra la tienda recien desplegada)
+#
+# SÓLO CON ETIQUETA X.Y.Z, Y SÓLO SI ESTÁ EN main. Las variables que usa
+# (HARBOR_AUTH, AWX_URL, AWX_PLANTILLA, AWX_TOKEN, DD_API_KEY, DD_APP_KEY) son
+# PROTEGIDAS: solo llegan
+# en refs protegidas, y las etiquetas *.*.* lo están.
+#
+# LO QUE MANDA ESTE REPO, sin pasar por el del clúster: k8s/app.yaml,
+# k8s/values.yaml y k8s/datadog-chart-version. El playbook los coge de ESTE
+# commit, cambia las imágenes shop-api y shop-web por las que construye este
+# pipeline y lo aplica. Lo que NO puede: Secrets, otro namespace, otros hosts
+# que datadog.iochannel.tech, ni objetos de clúster en app.yaml. Si lo intenta,
+# el job de AWX se para antes de aplicar nada y dice por qué.
+# ═══════════════════════════════════════════════════════════════════════════
+stages: [guarda, test, imagen, desplegar, marcar, probar]
+
+.solo-version:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+$/
+
+en-main:
+  stage: guarda
+  extends: .solo-version
+  image: alpine/git:latest
+  variables:
+    GIT_DEPTH: 0
+  script:
+    - 'git fetch --quiet origin main 2>/dev/null || { echo "LA RAMA main NO EXISTE: empuja main antes de etiquetar."; exit 1; }'
+    - 'git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main || { echo "LA ETIQUETA $CI_COMMIT_TAG NO ESTÁ EN main."; exit 1; }'
+    - echo "GUARDA> $CI_COMMIT_TAG está en main ($(git rev-parse --short "$CI_COMMIT_SHA"))"
+
+# ── TESTS DE shop-api, CON EL TRACER DE DATADOG ──────────────────────────────
+# Test Optimization: cada ejecucion llega a Datadog (CI → Tests) con su duracion,
+# su resultado y su commit, y alli se ven los tests lentos, los inestables y la
+# historia de cada uno. El tracer va como -javaagent de Maven y en modo agentless:
+# en el runner no hay agente de Datadog, manda directo con DD_API_KEY.
+#
+# Tambien en cada push a main y no solo con etiqueta: asi hay historia de tests
+# sin desplegar nada. Sin DD_API_KEY los tests corren igual y solo no llegan.
+#
+# Bloquea imagen-api: un test rojo no llega a construir imagen ni a desplegar.
+# El tracer se baja con Maven (dd-java-agent, misma version que dd-trace-api del
+# pom) porque la imagen de maven no trae por que traer curl.
+tests-api:
+  stage: test
+  image: maven:3.9-eclipse-temurin-21
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+$/
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"
+  needs:
+    - job: en-main
+      optional: true
+  variables:
+    DD_SITE: datadoghq.eu
+    DD_ENV: ci
+    DD_SERVICE: shop-api
+    DD_CIVISIBILITY_ENABLED: "true"
+    DD_CIVISIBILITY_AGENTLESS_ENABLED: "true"
+    DD_TRACER_VERSION: "1.67.1"
+    M2: "$CI_PROJECT_DIR/.m2"
+    # Clon completo: con el superficial de GitLab el tracer no puede subir el arbol de
+    # git («fatal: error processing shallow info»), y sin el no hay enlaces al codigo ni
+    # seleccion de tests por cambios.
+    GIT_DEPTH: 0
+  cache:
+    key:
+      files: [app/pom.xml]
+    paths: [.m2]
+  script:
+    - '[ -n "$DD_API_KEY" ] || echo "SIN DD_API_KEY: los tests corren, pero no llegaran a Datadog"'
+    - mvn -q -B -Dmaven.repo.local="$M2" dependency:copy -Dartifact="com.datadoghq:dd-java-agent:$DD_TRACER_VERSION" -DoutputDirectory=/tmp/dd
+    - cd app
+    - MAVEN_OPTS="-javaagent:/tmp/dd/dd-java-agent-$DD_TRACER_VERSION.jar" mvn -B -Dmaven.repo.local="$M2" test
+    # SonarQube con la cobertura de JaCoCo, solo si el proyecto tiene SONAR_TOKEN y
+    # SONAR_HOST_URL; sin ellos lo dice y sigue. Sin el tracer: aqui no hay tests.
+    - 'if [ -n "$SONAR_TOKEN" ] && [ -n "$SONAR_HOST_URL" ]; then mvn -B -Dmaven.repo.local="$M2" org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4751:sonar -Dsonar.projectKey=datadog-entorno-shop-api -Dsonar.projectName="datadog-entorno shop-api" -Dsonar.host.url="$SONAR_HOST_URL" -Dsonar.token="$SONAR_TOKEN"; else echo "SIN SONAR_TOKEN o SONAR_HOST_URL: no se analiza en SonarQube"; fi'
+  artifacts:
+    when: always
+    reports:
+      junit: app/target/surefire-reports/TEST-*.xml
+
+# Imágenes a curso/ en Harbor. HARBOR_AUTH es un robot propio de este repositorio
+# con push SOLO en `curso`; lo crea 090-datadog-curso-ci en el repo del clúster.
+.kaniko:
+  stage: imagen
+  extends: .solo-version
+  needs: [en-main]
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  before_script:
+    - '[ -n "$HARBOR_AUTH" ] || { echo "FALTA HARBOR_AUTH: variable protegida del proyecto"; exit 1; }'
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"registry.ivanosuna.com\":{\"auth\":\"$HARBOR_AUTH\"}}}" > /kaniko/.docker/config.json
+
+imagen-api:
+  extends: .kaniko
+  needs: [en-main, tests-api]
+  script:
+    - /kaniko/executor
+        --context "$CI_PROJECT_DIR/app"
+        --dockerfile "$CI_PROJECT_DIR/app/Dockerfile"
+        --build-arg "DD_GIT_REPOSITORY_URL=$CI_PROJECT_URL"
+        --build-arg "DD_GIT_COMMIT_SHA=$CI_COMMIT_SHA"
+        --destination "registry.ivanosuna.com/curso/shop-api:$CI_COMMIT_SHORT_SHA"
+        --destination "registry.ivanosuna.com/curso/shop-api:$CI_COMMIT_TAG"
+        --single-snapshot
+    - echo "IMAGEN> curso/shop-api:$CI_COMMIT_SHORT_SHA"
+
+# Contexto: la raíz del repo, porque el Dockerfile copia web/ y nginx/.
+imagen-web:
+  extends: .kaniko
+  script:
+    - /kaniko/executor
+        --context "$CI_PROJECT_DIR"
+        --dockerfile "$CI_PROJECT_DIR/web/Dockerfile"
+        --destination "registry.ivanosuna.com/curso/shop-web:$CI_COMMIT_SHORT_SHA"
+        --destination "registry.ivanosuna.com/curso/shop-web:$CI_COMMIT_TAG"
+        --single-snapshot
+    - echo "IMAGEN> curso/shop-web:$CI_COMMIT_SHORT_SHA"
+
+# Lanza la plantilla de AWX y espera a que acabe: un pipeline verde con el
+# despliegue a medias es peor que uno rojo. SI FALLA, ESTE JOB VUELCA EL FINAL DE
+# LA SALIDA DE AWX: ahí está el motivo —qué límite se ha saltado el repo, o el
+# estado, los logs y los eventos de los pods que no arrancan—, sin tener que
+# pedírselo a nadie con acceso a AWX.
+desplegar:
+  stage: desplegar
+  extends: .solo-version
+  needs: [imagen-api, imagen-web]
+  image: curlimages/curl:8.10.1
+  variables:
+    GIT_STRATEGY: none
+    AWX_MINUTOS: "25"
+  script:
+    - '[ -n "$AWX_URL" ] && [ -n "$AWX_PLANTILLA" ] && [ -n "$AWX_TOKEN" ] || { echo "FALTAN AWX_URL, AWX_PLANTILLA o AWX_TOKEN"; exit 1; }'
+    - 'CUERPO="{\"extra_vars\":{\"datadog_curso_imagen_sha\":\"$CI_COMMIT_SHORT_SHA\",\"datadog_curso_version\":\"$CI_COMMIT_TAG\"}}"'
+    - 'RESPUESTA=$(curl --fail --silent --show-error -X POST -H "Authorization: Bearer $AWX_TOKEN" -H "Content-Type: application/json" -d "$CUERPO" "$AWX_URL/api/v2/job_templates/$AWX_PLANTILLA/launch/")'
+    - 'JOB=$(printf "%s" "$RESPUESTA" | sed -n "s/.*\"job\":\([0-9]*\).*/\1/p")'
+    - '[ -n "$JOB" ] || { echo "AWX NO DEVOLVIÓ UN JOB:"; printf "%s\n" "$RESPUESTA" | head -c 800; exit 1; }'
+    - echo "AWX> job $JOB -> $AWX_URL/#/jobs/playbook/$JOB/output"
+    - 'i=0; while [ $i -lt $((AWX_MINUTOS * 6)) ]; do ESTADO=$(curl --fail --silent -H "Authorization: Bearer $AWX_TOKEN" "$AWX_URL/api/v2/jobs/$JOB/" | sed -n "s/.*\"status\":\"\([a-z]*\)\".*/\1/p"); case "$ESTADO" in successful) echo "DESPLEGADO> job $JOB"; exit 0;; failed|error|canceled) echo "EL DESPLIEGUE ACABÓ EN $ESTADO: job $JOB. Lo que dice AWX, el final:"; curl --silent -H "Authorization: Bearer $AWX_TOKEN" "$AWX_URL/api/v2/jobs/$JOB/stdout/?format=txt" | tail -n 80; exit 1;; esac; sleep 10; i=$((i + 1)); done; echo "EL PLAYBOOK NO ACABÓ EN $AWX_MINUTOS MINUTOS"; exit 1'
+
+# ── EL EVENTO DE VERSION NUEVA ───────────────────────────────────────────────
+# Un evento en Event Management por despliegue: es lo que dibuja la barra vertical
+# en las graficas («¿empezo esto con un despliegue?») y lo que puede vigilar un
+# monitor de eventos para avisar.
+#
+# CON curl A LA API v2 DE INGESTA, y no con una CLI: esta org rechaza la API v1 de
+# eventos («not enabled for the v1 events API», probado el 20-11-2026), que es la
+# unica que habla `dog`, y datadog-ci no tiene comando de eventos. La v2 en
+# api.datadoghq.eu da 403 con estas claves; event-management-intake acepta solo
+# con DD_API_KEY (202).
+#
+# category change: un cambio con su recurso, a quien afecta y el valor nuevo; sale
+# tambien en el Change Tracking de la pagina de cada servicio en APM.
+# El primero tras desplegar, para que su hora sea la del despliegue.
+evento-version:
+  stage: marcar
+  extends: .solo-version
+  needs: [desplegar]
+  image: curlimages/curl:8.10.1
+  allow_failure: true
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - '[ -n "$DD_API_KEY" ] || { echo "FALTA DD_API_KEY: variable protegida del proyecto, la pone 090-datadog-curso-ci"; exit 1; }'
+    - |
+      cat > /tmp/evento.json <<EOF
+      {"data": {"type": "event", "attributes": {
+        "category": "change",
+        "title": "Despliegue de la tienda $CI_COMMIT_TAG",
+        "message": "Pipeline $CI_PIPELINE_URL · commit $CI_COMMIT_SHORT_SHA · lanzado por $GITLAB_USER_NAME",
+        "tags": ["env:course", "service:shop-api", "service:shop-web", "version:$CI_COMMIT_TAG", "evento:despliegue", "source:gitlab"],
+        "attributes": {
+          "changed_resource": {"name": "tienda", "type": "configuration"},
+          "impacted_resources": [{"name": "shop-api", "type": "service"}, {"name": "shop-web", "type": "service"}],
+          "author": {"name": "gitlab-ci", "type": "system"},
+          "new_value": {"version": "$CI_COMMIT_TAG", "commit": "$CI_COMMIT_SHA"}
+        }}}}
+      EOF
+      curl --fail-with-body -sS -X POST "https://event-management-intake.datadoghq.eu/api/v2/events" \
+        -H "DD-API-KEY: $DD_API_KEY" -H "Content-Type: application/json" -d @/tmp/evento.json
+    - echo "EVENTO> despliegue $CI_COMMIT_TAG en Datadog"
+
+# ── REGISTRAR EL DESPLIEGUE EN DATADOG ───────────────────────────────────────
+# Solo si `desplegar` acabo bien: es su `needs`, y un job no arranca si el que
+# necesita fallo. La version que ve Datadog en los pods la pone el playbook en
+# la label tags.datadoghq.com/version; esto es el evento de despliegue.
+#
+# CON `datadog-ci tag` Y NO CON `datadog-ci deployment mark`: en la 5.25.0
+# `deployment mark` no se registra —«Command not found» con cualquier opcion,
+# probado el 16-10-2026, y lo mismo en la 4.4.0— aunque su codigo va dentro.
+# `mark` no hace mas que esto: etiquetar el job con datadog_cd_visibility.* y el
+# pipeline con ci.pipeline.contains_deployment. Mismas etiquetas, a mano.
+#
+# UN JOB POR SERVICIO: Datadog toma cada job marcado como UN despliegue, de UN
+# servicio. Uno detras de otro y no en paralelo, porque el runner solo tiene
+# hueco para un job a la vez y el segundo moriria esperando.
+#
+# allow_failure: el despliegue ya esta hecho. Si Datadog no contesta, el
+# pipeline queda en naranja y lo dice, pero no en rojo como si no se hubiera
+# desplegado.
+.marcar:
+  stage: marcar
+  extends: .solo-version
+  image: node:22-alpine
+  allow_failure: true
+  variables:
+    GIT_STRATEGY: none
+    DD_SITE: datadoghq.eu
+    DD_ENTORNO: course
+    DATADOG_CI_VERSION: "5.25.0"
+  script:
+    - '[ -n "$DD_API_KEY" ] || { echo "FALTA DD_API_KEY: variable protegida del proyecto, la pone 090-datadog-curso-ci"; exit 1; }'
+    - npm install --global --silent --no-audit --no-fund "@datadog/datadog-ci@$DATADOG_CI_VERSION"
+    - datadog-ci tag --level job
+        --tags datadog_cd_visibility.is_deployment:true
+        --tags "datadog_cd_visibility.env:$DD_ENTORNO"
+        --tags "datadog_cd_visibility.service:$SERVICIO"
+        --tags "datadog_cd_visibility.revision:$CI_COMMIT_TAG"
+    - datadog-ci tag --level pipeline --tags ci.pipeline.contains_deployment:true
+    # DORA Metrics: frecuencia de despliegue y tiempo desde el commit hasta
+    # produccion. El inicio es la creacion del pipeline, que es cuando arranca el
+    # camino del commit hacia el entorno.
+    - datadog-ci dora deployment --service "$SERVICIO" --env "$DD_ENTORNO" --version "$CI_COMMIT_TAG"
+        --started-at "$CI_PIPELINE_CREATED_AT"
+        --git-repository-url "$CI_PROJECT_URL" --git-commit-sha "$CI_COMMIT_SHA"
+    - echo "MARCADO> $SERVICIO $CI_COMMIT_TAG en $DD_ENTORNO ($DD_SITE)"
+
+# Este con checkout y no GIT_STRATEGY none: sube los metadatos de git del commit
+# (git-metadata upload), que es lo que deja a Datadog resolver los ficheros de
+# las trazas de pila contra el repo. Con uno basta: el repo es el mismo.
+marcar-shop-api:
+  extends: .marcar
+  needs: [evento-version]
+  variables:
+    SERVICIO: shop-api
+    GIT_STRATEGY: fetch
+  before_script:
+    - apk add --quiet --no-cache git
+  after_script:
+    - datadog-ci git-metadata upload --repository-url "$CI_PROJECT_URL" || echo "NO SE SUBIERON LOS METADATOS DE GIT"
+
+marcar-shop-web:
+  extends: .marcar
+  needs: [marcar-shop-api]
+  variables:
+    SERVICIO: shop-web
+
+# ── LOS TESTS DE SYNTHETICS CONTRA LO RECIEN DESPLEGADO ──────────────────────
+# Continuous Testing: los robots de Datadog prueban la tienda publica despues de
+# cada despliegue. SIN allow_failure, a diferencia de marcar-*: si la tienda
+# recien desplegada no pasa los robots, el pipeline queda en ROJO. Los tests
+# llevan ya un reintento propio en Datadog.
+#
+# --failOnCriticalErrors y --failOnMissingTests: sin ellos, una clave mala, un
+# Datadog que no contesta o un test borrado acaban en VERDE sin haber probado
+# nada.
+#
+# Tras marcar-shop-web y no en paralelo: el runner solo tiene hueco para un job
+# a la vez. Tarda 2-3 minutos.
+#
+# Tambien se lanza SOLO, sin version ni despliegue: Build -> Pipelines -> Run
+# pipeline sobre main con PROBAR_SYNTHETICS=si (o `glab ci run -b main --variables
+# PROBAR_SYNTHETICS:si`). Solo en main, que es protegida: las claves no llegan a
+# otra rama.
+#
+# Con checkout y no GIT_STRATEGY none: datadog-ci saca del repo el autor y el
+# mensaje del commit, y sin ellos Datadog marca la ejecucion como "Test setup is
+# incomplete / missing git information".
+probar-synthetics:
+  stage: probar
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+$/
+    - if: $PROBAR_SYNTHETICS == "si" && $CI_COMMIT_BRANCH == "main"
+  needs:
+    - job: marcar-shop-web
+      optional: true
+  image: node:22-alpine
+  variables:
+    DATADOG_SITE: datadoghq.eu
+    DATADOG_CI_VERSION: "5.25.0"
+    # IDs de la org de la 2a edicion ("ivan - shop api products" y "ivan - shop
+    # checkout journey", de create_reference.py). Cambian con cada org nueva: los de
+    # octubre (fc3-q39-vq2, d82-buz-mzq) tumbaron este job en la 1.0.9.
+    TESTS_SYNTHETICS: "jbm-gj4-3fm g59-2fb-fx4"
+  script:
+    - '[ -n "$DD_API_KEY" ] && [ -n "$DD_APP_KEY" ] || { echo "FALTAN DD_API_KEY o DD_APP_KEY: variables protegidas del proyecto, las pone 090-datadog-curso-ci"; exit 1; }'
+    # El plugin de synthetics no viene en datadog-ci: lo instala solo al primer uso,
+    # pero eso no está probado dentro del contenedor y en clase no queremos sorpresas.
+    - npm install --global --silent --no-audit --no-fund "@datadog/datadog-ci@$DATADOG_CI_VERSION" "@datadog/datadog-ci-plugin-synthetics@$DATADOG_CI_VERSION"
+    - IDS=""; for T in $TESTS_SYNTHETICS; do IDS="$IDS --public-id $T"; done
+    - DATADOG_API_KEY="$DD_API_KEY" DATADOG_APP_KEY="$DD_APP_KEY" datadog-ci synthetics run-tests $IDS --failOnCriticalErrors --failOnMissingTests
+
+# ── LOS LOGS DE LOS JOBS, A DATADOG ──────────────────────────────────────────
+# La recogida nativa no funciona aqui: Datadog descarga cada log del almacenamiento
+# de objetos de GitLab, que es un MinIO interno, y no llega (GitLab avisa, Datadog
+# contesta ok y el log no aparece nunca). Este job lee las trazas de todos los jobs
+# del pipeline con la API de GitLab y las manda a Datadog Logs con
+# datadog.product:cipipeline y source:gitlab. Detalle en ci/logs_a_datadog.py.
+#
+# En .post y when: always: el ultimo, y tambien cuando algo ha fallado, que es
+# cuando mas se miran los logs. GITLAB_TOKEN_LOGS es un token de proyecto con
+# solo read_api (el CI_JOB_TOKEN no puede leer trazas).
+logs-a-datadog:
+  stage: .post
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\.[0-9]+\.[0-9]+$/
+      when: always
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"
+      when: always
+    - if: $PROBAR_SYNTHETICS == "si" && $CI_COMMIT_BRANCH == "main"
+      when: always
+  image: python:3.13-alpine
+  allow_failure: true
+  variables:
+    DD_SITE: datadoghq.eu
+  script:
+    - '[ -n "$GITLAB_TOKEN_LOGS" ] && [ -n "$DD_API_KEY" ] || { echo "FALTAN GITLAB_TOKEN_LOGS o DD_API_KEY: variables protegidas del proyecto"; exit 1; }'
+    - python3 ci/logs_a_datadog.py

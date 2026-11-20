@@ -27,9 +27,6 @@ public class PaymentGateway {
     // @Trace creates a custom span: the auto-instrumentation only sees HTTP,
     // JDBC, etc. Business steps need to be declared explicitly.
     @Trace(operationName = "payment.charge", resourceName = "PaymentGateway.charge")
-    // Esto no crea una traza, aunque ponga eso en el nombre. SOLO CREA UN SPAN dentro de una traza (de la traza actual)
-    // Donde se crea la traza? El el cliente!
-    // Eso es de la librería de DATADOG! (SDK)
     public String charge(String customer, double amount) {
         long start = System.currentTimeMillis();
         try {

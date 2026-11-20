@@ -53,6 +53,12 @@
   <h2>Products</h2>
   <div id="products" class="grid"></div>
 
+  <h2>Marketing</h2>
+  <div class="card">
+    <label>Campaign: <input id="campaign" value="black-friday"></label>
+    <button id="btn-campaign">Activate promo campaign</button>
+  </div>
+
   <h2>Demo buttons (things that go wrong on purpose)</h2>
   <div class="card">
     <button id="btn-slow">Slow request</button>
@@ -117,6 +123,14 @@
     document.getElementById('identify').onclick = () => {
       const name = document.getElementById('customer').value;
       if (window.DD_RUM) { DD_RUM.setUser({ id: name, name }); log(`RUM user set to ${name}`); }
+    };
+    // A business event: the backend records it in Datadog (evento:negocio) and the dashboards
+    // draw it as a vertical bar over traffic and orders.
+    document.getElementById('btn-campaign').onclick = () => {
+      const name = encodeURIComponent(document.getElementById('campaign').value.trim().toLowerCase());
+      api('/api/campaign?name=' + name, { method: 'POST' })
+        .then(() => log('promo campaign ' + decodeURIComponent(name) + ' activated'))
+        .catch(() => {});
     };
     document.getElementById('btn-slow').onclick = () => api('/api/slow').catch(()=>{});
     document.getElementById('btn-error').onclick = () => api('/api/error').catch(()=>{});

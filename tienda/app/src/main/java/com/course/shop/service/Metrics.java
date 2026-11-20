@@ -35,12 +35,25 @@ public class Metrics {
 
     public void paymentDuration(long millis, boolean ok) {
         client.histogram("payment.duration", millis, "status:" + (ok ? "ok" : "failed"));
-    } // Esta que hay aqui no debería estar aquí!
-    // No debería tratarse como una métrica... conceptualmente es una traza!
-    // Pero necesitaba un ejemplo apra incluir los histogramas.
+    }
 
     public void stockLevel(String productName, int stock) {
         client.gauge("stock.units", stock, "product:" + productName);
+    }
+
+    /**
+     * A business event: something the business did (a campaign, a price change), not something
+     * the system did. Tagged evento:negocio so a dashboard can overlay it on the graphs and show
+     * whether traffic or orders moved because of it.
+     */
+    public void businessEvent(String title, String text, String... tags) {
+        client.recordEvent(com.timgroup.statsd.Event.builder()
+                .withTitle(title).withText(text)
+                .withAlertType(com.timgroup.statsd.Event.AlertType.INFO).build(), tags);
+    }
+
+    public void campaignActivated(String campaign) {
+        client.incrementCounter("campaign.activated", "campaign:" + campaign);
     }
 
     public void event(String title, String text) {

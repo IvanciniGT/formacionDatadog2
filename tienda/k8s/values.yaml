@@ -12,7 +12,7 @@ targetSystem: linux
 
 datadog:
   site: datadoghq.eu
-  clusterName: ivanosuna-cluster          # shows as kube_cluster_name on everything
+  clusterName: iochannel-cluster          # shows as kube_cluster_name on everything
   criSocketPath: /var/run/crio/crio.sock  # the cluster runs cri-o, not containerd
   tags:
     - env:course
@@ -52,13 +52,19 @@ datadog:
   logs:
     enabled: true
     containerCollectAll: true
-    # SCOPE (decision for Ivan): collect only the course namespace. Remove the next line to collect everything.
     containerCollectUsingFiles: true
+  # SCOPE: only the course namespace. Include only RESCUES what an exclude drops, so the exclude
+  # has to catch everything else: until 1.1.0 it only excluded kube-system, and the logs of every
+  # namespace of the cluster (personal agents, ERP, Keycloak, exams...) reached an org the
+  # students can search.
   containerInclude: "kube_namespace:datadog-curso"
-  containerExclude: "kube_namespace:kube-system"
-  # the agent's own containers are in the namespace too: keep their logs out (noise in lab07).
-  # By container name: with cri-o the image: filter did not match.
-  containerExcludeLogs: "name:^agent$ name:^trace-agent$ name:^process-agent$ name:^system-probe$ name:^cluster-agent$"
+  containerExclude: "kube_namespace:.*"
+  # FOR LOGS THE *_LOGS LISTS WIN: as soon as containerExcludeLogs exists, the agent ignores
+  # containerExclude for logs. 1.1.0 had only the agent names here and kept collecting every
+  # namespace. So the namespace scope is repeated here, and the agent's own logs (they live in
+  # datadog-curso, which the include rescues) are dropped by the podAnnotations below.
+  containerIncludeLogs: "kube_namespace:datadog-curso"
+  containerExcludeLogs: "kube_namespace:.*"
   # Note: containerInclude/Exclude apply to logs, metrics (container-level) and autodiscovery of the
   # NODE agent. kube-state-metrics (cluster-level) still sees all namespaces, which is what we want
   # for the infrastructure module. If Ivan prefers "everything", delete the two lines above.
@@ -92,16 +98,14 @@ datadog:
 # Node agent: run on every node, control-plane included, with explicit resources
 # (worker4/worker5 are over-committed on limits; keep these honest).
 agents:
-  # worker4 has 99 % of its CPU already requested by other workloads: nothing fits there.
-  # Remove this affinity when Ivan frees CPU on worker4 (the node is then monitored too).
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
-              - key: kubernetes.io/hostname
-                operator: NotIn
-                values: [worker4]
+  # The agent's own logs are noise in lab07: every line dropped at the source.
+  podAnnotations:
+    ad.datadoghq.com/agent.logs: '[{"source":"datadog-agent","service":"datadog-agent","log_processing_rules":[{"type":"exclude_at_match","name":"logs_del_agente_fuera","pattern":"."}]}]'
+    ad.datadoghq.com/trace-agent.logs: '[{"source":"datadog-agent","service":"datadog-agent","log_processing_rules":[{"type":"exclude_at_match","name":"logs_del_agente_fuera","pattern":"."}]}]'
+    ad.datadoghq.com/process-agent.logs: '[{"source":"datadog-agent","service":"datadog-agent","log_processing_rules":[{"type":"exclude_at_match","name":"logs_del_agente_fuera","pattern":"."}]}]'
+    ad.datadoghq.com/system-probe.logs: '[{"source":"datadog-agent","service":"datadog-agent","log_processing_rules":[{"type":"exclude_at_match","name":"logs_del_agente_fuera","pattern":"."}]}]'
+  # No node affinity: until 1.0.8 worker4 was excluded (99 % CPU requested), and the
+  # shop-api replica scheduled there sent no logs, traces or metrics at all.
   tolerations:
     - key: node-role.kubernetes.io/control-plane
       operator: Exists
@@ -127,6 +131,8 @@ agents:
 
 clusterAgent:
   enabled: true
+  podAnnotations:
+    ad.datadoghq.com/cluster-agent.logs: '[{"source":"datadog-agent","service":"datadog-agent","log_processing_rules":[{"type":"exclude_at_match","name":"logs_del_agente_fuera","pattern":"."}]}]'
   replicas: 1
   resources:
     requests: { cpu: 100m, memory: 256Mi }
@@ -136,10 +142,26 @@ clusterAgent:
     mutateUnlabelled: false                # only pods with admission.datadoghq.com/enabled: "true"
   metricsProvider:
     enabled: false                         # no HPA on Datadog metrics in the course
+  # GitLab integration as a CLUSTER check: the GitLab tile asks to install it through Fleet
+  # Automation, which needs remote agent management; and autodiscovery on the gitlab pods is
+  # off because of the containerExclude above. Metrics only, no logs. The same endpoints the
+  # cluster's Prometheus scrapes through its ServiceMonitors.
+  confd:
+    gitlab.yaml: |-
+      cluster_check: true
+      init_config:
+      instances:
+        - openmetrics_endpoint: http://gitlab-webservice-default.gitlab.svc:8083/metrics
+          gitlab_url: http://gitlab-webservice-default.gitlab.svc:8181
+          gitaly_server_endpoint: http://gitlab-gitaly.gitlab.svc:9236/metrics
+          tags:
+            - gitlab_instance:gitlab.ivanosuna.com
 
 # Cluster checks runner: where the Postgres DBM cluster check executes
 clusterChecksRunner:
   enabled: true
+  podAnnotations:
+    ad.datadoghq.com/agent.logs: '[{"source":"datadog-agent","service":"datadog-agent","log_processing_rules":[{"type":"exclude_at_match","name":"logs_del_agente_fuera","pattern":"."}]}]'
   replicas: 1
   resources:
     requests: { cpu: 100m, memory: 128Mi }

@@ -1,0 +1,15 @@
+# Mounted into the agent container at /etc/datadog-agent/conf.d/postgres.d/conf.yaml
+# Standard Postgres integration + Database Monitoring.
+init_config:
+
+instances:
+  - host: postgres
+    port: 5432
+    username: datadog
+    password: datadog
+    dbname: shop
+    dbm: true                      # query metrics, samples and explain plans
+    collect_activity_metrics: true
+    tags:
+      - env:course
+      - service:shop-db

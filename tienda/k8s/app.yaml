@@ -245,21 +245,20 @@ spec:
     metadata:
       labels:
         app: shop-api
-        # UNIFIED SERVICE TAGGING: ÚNICO SITIO donde se escriben env / service / version.
-        # - El agente del nodo las pone en las métricas y los logs de este contenedor.
-        # - Las variables DD_* de abajo las LEEN de aquí (no se repiten).
-        # - version: la cambia EL PIPELINE en cada despliegue (igual que el tag de la imagen).
+        # Unified service tagging: the ONLY place where env/service/version are written.
+        # The DD_* env vars below read them from here (downward API), so nothing is duplicated.
+        # The deploy pipeline sets tags.datadoghq.com/version to the release tag on every deploy.
         tags.datadoghq.com/env: course
         tags.datadoghq.com/service: shop-api
-        tags.datadoghq.com/version: "1.0.5"
+        tags.datadoghq.com/version: "1.0.0"
+        admission.datadoghq.com/enabled: "true"
       annotations:
-        # Autodiscovery de logs: "source" dice QUÉ TIPO de log es (Java) para que Datadog
-        # sepa trocearlo. El "service" no hace falta: ya lo da la label de arriba.
+        # "source" picks the Java log pipeline; the service comes from the label above
         ad.datadoghq.com/shop-api.logs: '[{"source":"java"}]'
     spec:
       containers:
         - name: shop-api
-          image: registry.ivanosuna.com/curso/shop-api:1.0.5      # <- la pone el pipeline
+          image: registry.ivanosuna.com/curso/shop-api:1.0.0      # <- Harbor, project curso
           ports:
             - containerPort: 8081
           env:
@@ -271,26 +270,23 @@ spec:
               value: shop
             - name: DB_PASSWORD
               valueFrom: { secretKeyRef: { name: postgres-credentials, key: password } }
-            # Las 3 etiquetas para el TRACER (trazas y logs): se LEEN de las labels del pod.
-            # Ningún valor repetido: si el pipeline cambia la label, esto cambia solo.
             - name: DD_SERVICE
               valueFrom: { fieldRef: { fieldPath: "metadata.labels['tags.datadoghq.com/service']" } }
             - name: DD_ENV
               valueFrom: { fieldRef: { fieldPath: "metadata.labels['tags.datadoghq.com/env']" } }
             - name: DD_VERSION
               valueFrom: { fieldRef: { fieldPath: "metadata.labels['tags.datadoghq.com/version']" } }
-            # Dónde está el agente de Datadog: en el propio nodo (puertos 8126 trazas, 8125 métricas)
             - name: DD_AGENT_HOST
-              valueFrom: { fieldRef: { fieldPath: status.hostIP } }
-            - name: DD_LOGS_INJECTION          # mete trace_id y span_id en cada línea de log
+              valueFrom: { fieldRef: { fieldPath: status.hostIP } }   # the node's agent (hostPort 8126/8125)
+            - name: DD_LOGS_INJECTION
               value: "true"
-            - name: DD_TRACE_SAMPLE_RATE       # guardar el 100 % de las trazas (en una demo)
+            - name: DD_TRACE_SAMPLE_RATE
               value: "1"
-            - name: DD_PROFILING_ENABLED       # profiler: qué línea de código gasta CPU/memoria
+            - name: DD_PROFILING_ENABLED
               value: "true"
-            - name: DD_DBM_PROPAGATION_MODE    # trace id como comentario en el SQL (enlace con DBM)
+            - name: DD_DBM_PROPAGATION_MODE
               value: full
-            - name: DD_TRACE_OTEL_ENABLED      # acepta la API estándar de OpenTelemetry
+            - name: DD_TRACE_OTEL_ENABLED
               value: "true"
           # startupProbe gives the JVM up to 5 min on slow nodes before liveness starts judging it
           startupProbe:
@@ -335,11 +331,13 @@ spec:
     metadata:
       labels:
         app: shop-web
+        # Same rule as shop-api: written once here, read by DD_ENV / DD_VERSION below.
+        # The deploy pipeline sets tags.datadoghq.com/version to the release tag.
         tags.datadoghq.com/env: course
         tags.datadoghq.com/service: shop-web
         tags.datadoghq.com/version: "1.0.0"
       annotations:
-        ad.datadoghq.com/shop-web.logs: '[{"source":"nginx","service":"shop-web"}]'
+        ad.datadoghq.com/shop-web.logs: '[{"source":"nginx"}]'
     spec:
       containers:
         - name: shop-web
@@ -350,9 +348,9 @@ spec:
             - name: DD_SITE
               value: datadoghq.eu
             - name: DD_ENV
-              value: course
-            - name: DD_VERSION
-              value: "1.0.0"
+              valueFrom: { fieldRef: { fieldPath: "metadata.labels['tags.datadoghq.com/env']" } }
+            - name: DD_VERSION         # entrypoint.sh puts it in rum-config.js -> RUM sessions carry the version
+              valueFrom: { fieldRef: { fieldPath: "metadata.labels['tags.datadoghq.com/version']" } }
             - name: DD_RUM_APP_ID
               valueFrom: { secretKeyRef: { name: rum-credentials, key: app-id } }         # created by the playbook
             - name: DD_RUM_CLIENT_TOKEN
@@ -384,10 +382,10 @@ metadata:
 spec:
   ingressClassName: ingress-public
   tls:
-    - hosts: [datadog.ivanosuna.com]
+    - hosts: [datadog.iochannel.tech]
       secretName: shop-web-tls
   rules:
-    - host: datadog.ivanosuna.com
+    - host: datadog.iochannel.tech
       http:
         paths:
           - path: /

@@ -1,0 +1,30 @@
+# Service definition for the Software Catalog (lab05 / lab09). Synced by the GitHub/GitLab
+# integration on merge, or pushed with: datadog-ci service-catalog ... / the API / Terraform.
+apiVersion: v3
+kind: service
+metadata:
+  name: shop-api
+  displayName: Shop API
+  owner: team-training
+  tier: "1"
+  lifecycle: production
+  description: Orders and products REST API of the demo shop (Datadog course)
+  links:
+    - name: Runbook
+      type: runbook
+      url: https://wiki.example.com/runbooks/shop-api
+    - name: Ops dashboard
+      type: dashboard
+      url: https://app.datadoghq.eu/dashboard/lists
+    - name: Repo
+      type: repo
+      url: https://github.com/IvanciniGT/datadog-course
+  contacts:
+    - name: Shop team channel
+      type: slack
+      contact: https://example.slack.com/archives/shop
+spec:
+  languages: [java]
+  dependsOn:
+    - service:shop-db
+    - service:payment-provider

@@ -61,6 +61,13 @@
             <artifactId>java-dogstatsd-client</artifactId>
             <version>${dogstatsd.version}</version>
         </dependency>
+        <!-- JUnit 5, Mockito and AssertJ. The tests run in CI with the Datadog tracer attached,
+             so each run shows up in Test Optimization (flaky tests, slowest tests, history). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -69,6 +76,23 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <!-- Coverage report (target/site/jacoco/jacoco.xml): SonarQube reads it, and the
+                 pipeline uploads it to Datadog Code Coverage. -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.14</version>
+                <executions>
+                    <execution>
+                        <goals><goal>prepare-agent</goal></goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>test</phase>
+                        <goals><goal>report</goal></goals>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
